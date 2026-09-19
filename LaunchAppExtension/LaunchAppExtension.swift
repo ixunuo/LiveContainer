@@ -114,7 +114,7 @@ struct LaunchAppExtension: AppIntent {
         var bundleId: String? = nil
         var containerName: String? = nil
         var forceJIT: Bool = false
-        guard var components = URLComponents(url: launchURL, resolvingAgainstBaseURL: false) else {
+        guard let components = URLComponents(url: launchURL, resolvingAgainstBaseURL: false) else {
             throw LaunchAppExtensionError("URLComponents failed to initialize.")
         }
         
@@ -133,6 +133,19 @@ struct LaunchAppExtension: AppIntent {
         }
         guard let bundleId else {
             throw LaunchAppExtensionError("No bundle-name parameter found.")
+        }
+
+        try await launchGuestApp(bundleName: bundleId, containerName: containerName, forceJIT: forceJIT, preferredScheme: preferredScheme, fallbackURL: launchURL)
+        return .result()
+    }
+
+    func launchGuestApp(bundleName: String, containerName: String?, forceJIT: Bool, preferredScheme: String?, fallbackURL: URL) async throws {
+        var containerName = containerName
+        guard
+            let appGroupId = LCSharedUtils.appGroupID(),
+            let lcSharedDefaults = UserDefaults(suiteName: appGroupId)
+        else {
+            throw LaunchAppExtensionError("lcSharedDefaults failed to initialize, because no app group was found. Did you sign LiveContainer correctly?")
         }
                 
         // resolve private Documents bookmark
@@ -157,11 +170,11 @@ struct LaunchAppExtension: AppIntent {
         
         // launch app
         var isSharedApp = false
-        let appBundle = LCSharedUtils.findBundle(withBundleId: bundleId, isSharedAppOut: &isSharedApp)
+        let appBundle = LCSharedUtils.findBundle(withBundleId: bundleName, isSharedAppOut: &isSharedApp)
         guard let appBundle else {
             // app bundle cannot be found, we pass the url as-is in case it can only be handled by lc1
-            try await openURL(launchOptions: ["url": launchURL])
-            return .result()
+            try await openURL(launchOptions: ["url": fallbackURL])
+            return
         }
         
         // check if the app is locked/hidden/require JIT, if so we don't directly set keys in lcSharedDefaults
@@ -207,17 +220,20 @@ struct LaunchAppExtension: AppIntent {
 
         guard let schemeToLaunch else {
             // no free lc, we just open the lc1 and let the user to decide what to do
-            try await openURL(launchOptions: ["url": launchURL])
-            return .result()
+            try await openURL(launchOptions: ["url": fallbackURL])
+            return
         }
         
         if newLaunch && !forceJIT && !isHiden && !isLocked && !isJITNeeded {
             lcSharedDefaults.set(schemeToLaunch, forKey: "LCLaunchExtensionScheme")
-            lcSharedDefaults.set(bundleId, forKey: "LCLaunchExtensionBundleID")
+            lcSharedDefaults.set(bundleName, forKey: "LCLaunchExtensionBundleID")
             lcSharedDefaults.set(containerName, forKey: "LCLaunchExtensionContainerName")
             lcSharedDefaults.set(Date.now, forKey: "LCLaunchExtensionLaunchDate")
         }
 
+        guard var components = URLComponents(url: fallbackURL, resolvingAgainstBaseURL: false) else {
+            throw LaunchAppExtensionError("URLComponents failed to initialize.")
+        }
         components.scheme = schemeToLaunch
         guard let newURL = components.url else {
             throw LaunchAppExtensionError("unable to construct new url")
@@ -231,6 +247,5 @@ struct LaunchAppExtension: AppIntent {
             launchOptions["classicMode"] = cachedClassicMode
         }
         try await openURL(launchOptions: launchOptions)
-        return .result()
     }
 }
