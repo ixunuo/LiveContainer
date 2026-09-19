@@ -109,7 +109,8 @@ class RefreshHandler: NSObject, RefreshServer {
             extensionItem.userInfo = [
                 "selected": "builtinSideStore",
                 "bookmarks": [bookmarkData],
-                "endpoint": listener.endpoint
+                "endpoint": listener.endpoint,
+                "lcHomePath": NSHomeDirectory()
             ]
 
             guard let liveProcessURL = UserDefaults.lcMainBundle().builtInPlugInsURL?.appendingPathComponent("LiveProcess.appex"),

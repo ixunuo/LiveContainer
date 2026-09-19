@@ -191,6 +191,66 @@ static void SSInstallVersionWindow(UIWindowScene *windowScene)
 }
 
 
+#pragma mark - LiveProcess extension: remote-only Anisette + refresh diagnostics
+
+// The LiveProcess extension runs without a UI and cannot reliably complete local ADI (Unicorn) provisioning,
+// so a silent refresh has to use the remote Anisette servers. The override below is process-local: the
+// user-visible setting in the SideStore UI is left untouched.
+static BOOL (*LCOrigBoolForKey)(id, SEL, NSString*) = NULL;
+static id (*LCOrigObjectForKey)(id, SEL, NSString*) = NULL;
+static NSString* LCStoredUseOnDeviceAnisette = nil;
+
+static BOOL LCHookBoolForKey(NSUserDefaults* self, SEL cmd, NSString* key) {
+    if([key isEqualToString:@"useOnDeviceAnisette"]) {
+        return NO;
+    }
+    return LCOrigBoolForKey(self, cmd, key);
+}
+
+static id LCHookObjectForKey(NSUserDefaults* self, SEL cmd, NSString* key) {
+    if([key isEqualToString:@"useOnDeviceAnisette"]) {
+        return @NO;
+    }
+    return LCOrigObjectForKey(self, cmd, key);
+}
+
+static void installRemoteAnisetteOverride(void) {
+    NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
+    id storedValue = [ud objectForKey:@"useOnDeviceAnisette"];
+    LCStoredUseOnDeviceAnisette = storedValue ? [NSString stringWithFormat:@"%@", storedValue] : @"(unset)";
+
+    Method boolForKeyMethod = class_getInstanceMethod(NSUserDefaults.class, @selector(boolForKey:));
+    LCOrigBoolForKey = (BOOL (*)(id, SEL, NSString*))method_getImplementation(boolForKeyMethod);
+    method_setImplementation(boolForKeyMethod, (IMP)LCHookBoolForKey);
+
+    Method objectForKeyMethod = class_getInstanceMethod(NSUserDefaults.class, @selector(objectForKey:));
+    LCOrigObjectForKey = (id (*)(id, SEL, NSString*))method_getImplementation(objectForKeyMethod);
+    method_setImplementation(objectForKeyMethod, (IMP)LCHookObjectForKey);
+
+    NSLog(@"[SideStoreSupport] LiveProcess refresh: using remote Anisette (stored useOnDeviceAnisette=%@, HOME=%@)", LCStoredUseOnDeviceAnisette, NSHomeDirectory());
+}
+
+NSString* LCAnisetteDiagnostics(void) {
+    NSFileManager* fm = NSFileManager.defaultManager;
+    NSString* home = NSHomeDirectory();
+    NSString* guestId = NSUserDefaults.lcGuestAppId;
+    NSString* prefsPath = guestId ? [home stringByAppendingPathComponent:[NSString stringWithFormat:@"Library/Preferences/%@.plist", guestId]] : nil;
+    NSString* serversPath = [home stringByAppendingPathComponent:@"Documents/anisette-servers.json"];
+
+    NSMutableString* info = [NSMutableString string];
+    [info appendString:@"diagnostics:"];
+    [info appendFormat:@" HOME=%@", home];
+    [info appendFormat:@", LC_HOME=%s", getenv("LC_HOME_PATH") ?: "(unset)"];
+    [info appendFormat:@", LP_HOME=%s", getenv("LP_HOME_PATH") ?: "(unset)"];
+    [info appendFormat:@", guestId=%@", guestId ?: @"(nil)"];
+    [info appendFormat:@", storedODA=%@", LCStoredUseOnDeviceAnisette ?: @"(unknown)"];
+    [info appendFormat:@", prefs=%@", prefsPath ? ([fm fileExistsAtPath:prefsPath] ? @"present" : @"missing") : @"unknown"];
+    [info appendFormat:@", homeReadable=%@", [fm isReadableFileAtPath:home] ? @"yes" : @"no"];
+    [info appendFormat:@", serversJSON=%@", [fm fileExistsAtPath:serversPath] ? @"present" : @"missing"];
+    [info appendFormat:@", docsWritable=%@", [fm isWritableFileAtPath:[home stringByAppendingPathComponent:@"Documents"]] ? @"yes" : @"no"];
+    return info;
+}
+
 void installSideStoreHooks(void) {
 
     swizzleClassMethod(NSBundle.class, @selector(appbundleIdentifier), @selector(hook_appbundleIdentifier));
@@ -229,6 +289,9 @@ void installSideStoreHooks(void) {
         
     }
     
+    if (NSUserDefaults.isLiveProcess) {
+        installRemoteAnisetteOverride();
+    }
 
 }
 #pragma clang diagnostic pop

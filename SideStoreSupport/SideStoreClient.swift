@@ -91,6 +91,7 @@ struct SideStoreIntentCaller {
     @objc(performRefreshForRealWithIdentifier:mangledTypeName:server:)
     func performRefreshForReal(identifier: String, mangledTypeName: String, server: any RefreshServer) {
         Task {
+            let anisetteSeedState = ensureAnisetteServerListExists()
             do {
                 var obs: NSKeyValueObservation? = nil
                 try await SideStoreIntentCaller.shared.callRefreshIntent2(identifier: identifier, mangledTypeName: mangledTypeName) { progress in
@@ -103,9 +104,39 @@ struct SideStoreIntentCaller {
                 obs?.invalidate()
                 server.finish(nil)
             } catch {
-                server.finish(error.localizedDescription)
+                server.finish("\(LCAnisetteDiagnostics()) | anisetteSeed=\(anisetteSeedState) | \(error.localizedDescription)")
             }
         }
     }
 
+}
+
+private struct SeedAnisetteServer: Codable {
+    let name: String
+    let address: String
+    let isHidden: Bool
+}
+
+/// SideStore keeps its Anisette server list in its Documents directory and normally refreshes it when the app
+/// launches. A refresh that runs without the app can find it empty and fail with "no servers configured",
+/// so make sure the default server is there before the intent runs.
+private func ensureAnisetteServerListExists() -> String {
+    let fileManager = FileManager.default
+    guard let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else {
+        return "failedNoDocumentsDir"
+    }
+    let serversURL = documentsURL.appendingPathComponent("anisette-servers.json")
+    if fileManager.fileExists(atPath: serversURL.path) {
+        return "skippedExists"
+    }
+
+    let servers = [SeedAnisetteServer(name: "SideStore", address: "https://ani.sidestore.io", isHidden: false)]
+    do {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .prettyPrinted
+        try encoder.encode(servers).write(to: serversURL, options: .atomic)
+        return "written"
+    } catch {
+        return "failed(\(error.localizedDescription))"
+    }
 }
