@@ -5,4 +5,6 @@
 #include "XPCServer.h"
 #include "../LiveContainer/utils.h"
 #include "PrivateIntentRunner.h"
+
+NSString* LCAnisetteDiagnostics(void);
 #endif /* SideStore_Bridging_Header_h_h */

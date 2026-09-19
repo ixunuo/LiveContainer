@@ -18,6 +18,7 @@ set -euo pipefail
 LC_SRC=$(cd "$(dirname "$0")/.." && pwd)
 ARCHIVE=${1:?usage: package-sidestore.sh <LiveContainer.xcarchive> [output.ipa]}
 START=$PWD
+[[ "$ARCHIVE" = /* ]] || ARCHIVE="$START/$ARCHIVE"
 OUT=${2:-LiveContainer+SideStore.ipa}
 [[ "$OUT" = /* ]] || OUT="$START/$OUT"
 

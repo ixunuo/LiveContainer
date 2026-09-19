@@ -421,6 +421,12 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         if(isLiveProcess) {
             newHomePath = [lcUserDefaults stringForKey:@"specifiedSideStoreContainerPath"];;
             [lcUserDefaults removeObjectForKey:@"specifiedSideStoreContainerPath"];
+            if(newHomePath.length == 0) {
+                // No usable bookmark was handed over, fall back to the same data container the app uses
+                // instead of leaving HOME pointing at the extension's own container (which has no SideStore settings).
+                newHomePath = [docPath stringByAppendingPathComponent:@"SideStore"];
+                NSLog(@"[LCBootstrap] SideStore data container was not provided, falling back to %@", newHomePath);
+            }
         } else {
             newHomePath = [docPath stringByAppendingPathComponent:@"SideStore"];
         }

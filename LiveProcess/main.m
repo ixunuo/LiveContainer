@@ -77,8 +77,13 @@ int LiveProcessMain(int argc, char *argv[]) {
     }
     
     if ([appInfo[@"selected"] isEqualToString:@"builtinSideStore"]) {
-        if(access && bookmarkedUrls.count > 0) {
-            [lcUserDefaults setObject:bookmarkedUrls.firstObject.path forKey:@"specifiedSideStoreContainerPath"];
+        // Pass the data container on even when startAccessingSecurityScopedResource() failed: without it
+        // SideStore would run with the extension's own HOME and read its settings from an empty container.
+        NSString* sideStoreContainerPath = bookmarkedUrls.count > 0 ? bookmarkedUrls.firstObject.path : nil;
+        if(sideStoreContainerPath.length > 0) {
+            [lcUserDefaults setObject:sideStoreContainerPath forKey:@"specifiedSideStoreContainerPath"];
+        } else {
+            NSLog(@"[LiveProcess] Could not resolve the SideStore data container bookmark (access=%d)", access);
         }
         NSXPCListenerEndpoint* endpoint = appInfo[@"endpoint"];
 
