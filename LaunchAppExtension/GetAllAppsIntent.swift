@@ -155,7 +155,7 @@ struct LCGuestAppEntity: AppEntity {
     }
 
     static func liveContainerRow() -> LCGuestAppEntity {
-        LCGuestAppEntity(liveContainerSubtitle: LCLiveContainerApp.bundleIdentifier)
+        LCGuestAppEntity(liveContainerSubtitle: LCLiveContainerApp.expirySubtitle() ?? LCLiveContainerApp.bundleIdentifier)
     }
 
     static func emptyApps(diagnostics: [String]) -> LCGuestAppEntity {
@@ -318,9 +318,12 @@ enum LCSideStoreSupport {
     }
 
     static func expirySubtitle(now: Date = Date()) -> String? {
-        guard let expiration = profileExpirationDate() else {
-            return nil
-        }
+        let expiration = LCStoreRecords.expirationDate(forBundleIdentifier: LCStoreRecords.sideStoreBundleIdentifier)
+            ?? LCInstalledProfile.expirationDate()
+        return expiration.map { expiryText(for: $0, now: now) }
+    }
+
+    static func expiryText(for expiration: Date, now: Date = Date()) -> String {
         let remaining = expiration.timeIntervalSince(now)
         guard remaining > 0 else {
             return "⚠️ 已过期"
@@ -328,9 +331,65 @@ enum LCSideStoreSupport {
         let days = Int(ceil(remaining / 86400))
         return days <= 2 ? "⚠️ \(days)天后到期" : "\(days)天后到期"
     }
+}
 
-    // embedded.mobileprovision is a CMS blob wrapping the property list that carries ExpirationDate
-    private static func profileExpirationDate() -> Date? {
+// SideStore rewrites <app group>/widget_data.json at the end of every refresh with the dates it shows
+// in its own app list, so this copy moves with a renewal. The embedded.mobileprovision on disk can
+// lag behind it (SideStore itself falls back to its cached dates when the profile is older than the
+// last refresh), which is why the record is preferred over the profile.
+enum LCStoreRecords {
+    static let sideStoreBundleIdentifier = "com.SideStore.SideStore"
+
+    private struct Snapshot: Decodable {
+        struct App: Decodable {
+            let bundleIdentifier: String
+            let expirationDate: Date
+        }
+        let allApps: [App]?
+        let activeApps: [App]?
+    }
+
+    static func expirationDate(forBundleIdentifier wanted: String) -> Date? {
+        guard !wanted.isEmpty,
+              let fileURL = snapshotURL(),
+              let data = try? Data(contentsOf: fileURL) else {
+            return nil
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .deferredToDate
+        guard let snapshot = try? decoder.decode(Snapshot.self, from: data) else {
+            return nil
+        }
+        let apps = (snapshot.allApps ?? []) + (snapshot.activeApps ?? [])
+        return apps.first { $0.bundleIdentifier == wanted }?.expirationDate
+    }
+
+    private static func snapshotURL() -> URL? {
+        var groupIDs: [String] = []
+        if let appGroupID = LCSharedUtils.appGroupID() {
+            groupIDs.append(appGroupID)
+        }
+        // SideStore resolves its own group from the executable's entitlements, which can be the store's
+        // plain group instead of LiveContainer's team-suffixed one
+        groupIDs.append("group.com.SideStore.SideStore")
+        for groupID in groupIDs {
+            guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID) else {
+                continue
+            }
+            let fileURL = container.appendingPathComponent("widget_data.json")
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                return fileURL
+            }
+        }
+        return nil
+    }
+}
+
+// the profile the sideloader put into LiveContainer.app, i.e. when this app stops launching
+enum LCInstalledProfile {
+    static func expirationDate() -> Date? {
+        let appBundleURL = Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+        // embedded.mobileprovision is a CMS blob wrapping the property list that carries ExpirationDate
         let profileURL = appBundleURL.appendingPathComponent("embedded.mobileprovision")
         guard let data = try? Data(contentsOf: profileURL),
               let xmlStart = data.range(of: Data("<?xml".utf8)),
@@ -364,5 +423,11 @@ enum LCLiveContainerApp {
             }
         }
         return nil
+    }
+
+    static func expirySubtitle(now: Date = Date()) -> String? {
+        let expiration = bundleIdentifier.flatMap { LCStoreRecords.expirationDate(forBundleIdentifier: $0) }
+            ?? LCInstalledProfile.expirationDate()
+        return expiration.map { LCSideStoreSupport.expiryText(for: $0, now: now) }
     }
 }
