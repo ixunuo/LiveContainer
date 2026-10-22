@@ -4,6 +4,7 @@
 //
 
 import AppIntents
+import SQLite3
 import UIKit
 
 struct LCGuestAppError: LocalizedError {
@@ -318,7 +319,12 @@ enum LCSideStoreSupport {
     }
 
     static func expirySubtitle(now: Date = Date()) -> String? {
-        latestExpiration.map { expiryText(for: $0, now: now) }
+        // SideStore's list renders InstalledApp.expirationDate, so the same field is shown here; the
+        // heuristic sources are only a fallback for when the store database cannot be read
+        if let expiration = LCStoreDatabase.expirationDate(forBundleIdentifier: LCStoreRecords.sideStoreBundleIdentifier) {
+            return LCExpiry.text(for: expiration, now: now)
+        }
+        return latestExpiration.map { LCExpiry.text(for: $0, now: now, estimated: true) }
     }
 
     // SideStore's runtime lives inside LiveContainer, so the store dies with this app: the newest
@@ -338,12 +344,7 @@ enum LCSideStoreSupport {
     }
 
     static func expiryText(for expiration: Date, now: Date = Date()) -> String {
-        let remaining = expiration.timeIntervalSince(now)
-        guard remaining > 0 else {
-            return "⚠️ 已过期"
-        }
-        let days = Int(ceil(remaining / 86400))
-        return days <= 2 ? "⚠️ \(days)天后到期" : "\(days)天后到期"
+        LCExpiry.text(for: expiration, now: now)
     }
 }
 
@@ -357,6 +358,103 @@ enum LCExpiry {
     // picking the latest expiration, so a stale leftover record cannot mask a shorter real deadline
     static func latest(_ candidates: [LCExpiryCandidate]) -> Date? {
         candidates.max { $0.renewed < $1.renewed }?.expires
+    }
+
+    // SideStore's own pill uses calendar day components (then hours inside the last day), so the
+    // numbers have to be computed the same way or the lists disagree by a day. "≈" marks a fallback
+    // value (the store database could not be read), i.e. a number SideStore itself may not show.
+    static func text(for expiration: Date, now: Date = Date(), estimated: Bool = false) -> String {
+        let prefix = estimated ? "≈" : ""
+        guard expiration.timeIntervalSince(now) > 0 else {
+            return "⚠️ \(prefix)已过期"
+        }
+        let calendar = Calendar.current
+        let days = calendar.dateComponents([.day], from: now, to: expiration).day ?? 0
+        if days >= 1 {
+            return days <= 2 ? "⚠️ \(prefix)\(days)天后到期" : "\(prefix)\(days)天后到期"
+        }
+        let hours = max(1, calendar.dateComponents([.hour], from: now, to: expiration).hour ?? 0)
+        return "⚠️ \(prefix)\(hours)小时后到期"
+    }
+}
+
+// SideStore's app list renders InstalledApp.expirationDate straight out of its CoreData store, so
+// reading the same row is the only way this subtitle can agree with what SideStore shows for that app.
+// The store lives in the built-in SideStore's home (<LC documents>/SideStore) and is named after the
+// CoreData container ("AltStore").
+enum LCStoreDatabase {
+    static func expirationDate(forBundleIdentifier wanted: String) -> Date? {
+        guard !wanted.isEmpty else {
+            return nil
+        }
+        for url in storeURLs() {
+            if let date = read(url: url, bundleIdentifier: wanted) {
+                return date
+            }
+        }
+        return nil
+    }
+
+    private static func read(url: URL, bundleIdentifier wanted: String) -> Date? {
+        var db: OpaquePointer?
+        if sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE, nil) != SQLITE_OK {
+            sqlite3_close(db)
+            db = nil
+            if sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil) != SQLITE_OK {
+                sqlite3_close(db)
+                db = nil
+                // sidecar (-wal/-shm) files may not be openable from the extension; the main file alone
+                // still holds the last checkpointed state
+                guard sqlite3_open_v2("file:\(url.path)?immutable=1", &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK else {
+                    sqlite3_close(db)
+                    return nil
+                }
+            }
+        }
+        defer { sqlite3_close(db) }
+
+        // CoreData stores this attribute as REAL seconds since 2001-01-01
+        let sql = "SELECT ZEXPIRATIONDATE FROM ZINSTALLEDAPP WHERE ZBUNDLEIDENTIFIER = ?1 AND ZEXPIRATIONDATE IS NOT NULL ORDER BY ZEXPIRATIONDATE DESC LIMIT 1"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return nil
+        }
+        defer { sqlite3_finalize(stmt) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        guard sqlite3_bind_text(stmt, 1, wanted, -1, transient) == SQLITE_OK,
+              sqlite3_step(stmt) == SQLITE_ROW,
+              sqlite3_column_type(stmt, 0) != SQLITE_NULL else {
+            return nil
+        }
+        return Date(timeIntervalSinceReferenceDate: sqlite3_column_double(stmt, 0))
+    }
+
+    private static func storeURLs() -> [URL] {
+        var homes: [URL] = []
+        if let documents = LCGuestAppList.privateDocURL() {
+            homes.append(documents.appendingPathComponent("SideStore"))
+        }
+        if let appGroup = LCSharedUtils.appGroupPath() {
+            homes.append(appGroup.appendingPathComponent("SideStore"))
+        }
+        var urls: [URL] = []
+        for home in homes {
+            for relativePath in ["Library/Application Support/AltStore.sqlite",
+                                 "Library/Application Support/AltStore/AltStore.sqlite"] {
+                let url = home.appendingPathComponent(relativePath)
+                if FileManager.default.fileExists(atPath: url.path), !urls.contains(url) {
+                    urls.append(url)
+                }
+            }
+            // tolerate layout differences: any sqlite file directly under Application Support
+            let support = home.appendingPathComponent("Library/Application Support")
+            if let contents = try? FileManager.default.contentsOfDirectory(at: support, includingPropertiesForKeys: nil) {
+                for item in contents where item.pathExtension == "sqlite" && !urls.contains(item) {
+                    urls.append(item)
+                }
+            }
+        }
+        return urls
     }
 }
 
@@ -465,6 +563,13 @@ enum LCLiveContainerApp {
     }
 
     static func expirySubtitle(now: Date = Date()) -> String? {
+        if let bundleIdentifier, let expiration = LCStoreDatabase.expirationDate(forBundleIdentifier: bundleIdentifier) {
+            return LCExpiry.text(for: expiration, now: now)
+        }
+        return fallbackExpiration.map { LCExpiry.text(for: $0, now: now, estimated: true) }
+    }
+
+    private static var fallbackExpiration: Date? {
         var candidates: [LCExpiryCandidate] = []
         if let bundleIdentifier {
             for record in LCStoreRecords.records() where record.bundleIdentifier == bundleIdentifier {
@@ -474,6 +579,6 @@ enum LCLiveContainerApp {
         if let profile = LCInstalledProfile.profile() {
             candidates.append(LCExpiryCandidate(renewed: profile.created ?? .distantPast, expires: profile.expiration))
         }
-        return LCExpiry.latest(candidates).map { LCSideStoreSupport.expiryText(for: $0, now: now) }
+        return LCExpiry.latest(candidates)
     }
 }

@@ -89,6 +89,12 @@ enum LCGuestAppList {
         return parts.isEmpty ? "" : " (\(parts.joined(separator: ", ")) skipped)"
     }
 
+    // LiveContainer's private documents directory, used by the store database lookup as well
+    static func privateDocURL() -> URL? {
+        let sharedDefaults = LCSharedUtils.appGroupID().flatMap { UserDefaults(suiteName: $0) }
+        return resolvePrivateDocURL(sharedDefaults: sharedDefaults)
+    }
+
     private static func resolvePrivateDocURL(sharedDefaults: UserDefaults?) -> URL? {
         if let cachedPrivateDocURL {
             return cachedPrivateDocURL
