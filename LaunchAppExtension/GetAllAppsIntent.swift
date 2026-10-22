@@ -347,17 +347,19 @@ enum LCExpiry {
         return future.max() ?? dates.max()
     }
 
-    // identical to SideStore's own pill: DateComponentsFormatter with the largest allowed unit, which
-    // rounds to the nearest unit ("6.999 days" -> "7 days"); expired rows read EXPIRED there too
+    // "X天后到期", with a warning in front when X <= 2. Days round to the nearest day so a freshly
+    // renewed 7 day profile reads 7 (SideStore's own countdown rounds the same way).
     static func text(for expiration: Date, now: Date = Date()) -> String {
-        guard expiration.timeIntervalSince(now) > 0 else {
-            return "EXPIRED"
+        let remaining = expiration.timeIntervalSince(now)
+        guard remaining > 0 else {
+            return "⚠️ 已过期"
         }
-        let formatter = DateComponentsFormatter()
-        formatter.unitsStyle = .full
-        formatter.allowedUnits = [.day, .hour, .minute]
-        formatter.maximumUnitCount = 1
-        return formatter.string(from: now, to: expiration) ?? "EXPIRED"
+        let days = Int((remaining / 86400).rounded())
+        if days >= 1 {
+            return days <= 2 ? "⚠️ \(days)天后到期" : "\(days)天后到期"
+        }
+        let hours = max(1, Int((remaining / 3600).rounded()))
+        return "⚠️ \(hours)小时后到期"
     }
 }
 
