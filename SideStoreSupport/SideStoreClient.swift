@@ -156,6 +156,12 @@ public final class LCStoreExpiryPublisher: NSObject {
     private struct CacheFile: Codable {
         let written: Double
         let apps: [String: StoreEntry]
+        // what this process could see, so a "still shows ≈" report can be diagnosed from the app group
+        let home: String
+        let found: String?
+        let tried: [String]
+        let error: String?
+        let process: String
     }
 
     @objc public static func publish() {
@@ -166,22 +172,41 @@ public final class LCStoreExpiryPublisher: NSObject {
 
     // LiveProcess can be torn down as soon as the refresh is reported, so the exit path writes inline
     @objc public static func publishNow() {
-        guard let apps = readStore(), !apps.isEmpty,
-              let groupURL = LCSharedUtils.appGroupPath() else {
+        guard let groupURL = LCSharedUtils.appGroupPath() else {
             return
         }
-        let cache = CacheFile(written: Date().timeIntervalSinceReferenceDate, apps: apps)
-        guard let data = try? JSONEncoder().encode(cache) else { return }
-        try? data.write(to: groupURL.appendingPathComponent("LCStoreExpiry.json"), options: .atomic)
-    }
-
-    private static func readStore() -> [String: StoreEntry]? {
-        for url in storeURLs() {
-            if let entries = read(url: url) {
-                return entries
+        let candidates = storeURLs()
+        var tried: [String] = []
+        var found: String?
+        var apps: [String: StoreEntry] = [:]
+        for url in candidates {
+            let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+            let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+            tried.append("\(url.path) exists=\(size > 0) size=\(size)")
+            if found == nil, size > 0, let entries = read(url: url) {
+                found = url.path
+                apps = entries
             }
         }
-        return nil
+        let error: String?
+        if candidates.isEmpty {
+            error = "no store candidates under HOME"
+        } else if found == nil {
+            error = "store found but unreadable"
+        } else if apps.isEmpty {
+            error = "store readable but ZINSTALLEDAPP is empty"
+        } else {
+            error = nil
+        }
+        let cache = CacheFile(written: Date().timeIntervalSinceReferenceDate,
+                              apps: apps,
+                              home: NSHomeDirectory(),
+                              found: found,
+                              tried: tried,
+                              error: error,
+                              process: Bundle.main.bundleURL.pathExtension == "appex" ? "extension" : "app")
+        guard let data = try? JSONEncoder().encode(cache) else { return }
+        try? data.write(to: groupURL.appendingPathComponent("LCStoreExpiry.json"), options: .atomic)
     }
 
     private static func read(url: URL) -> [String: StoreEntry]? {
@@ -221,11 +246,13 @@ public final class LCStoreExpiryPublisher: NSObject {
         let home = URL(fileURLWithPath: NSHomeDirectory())
         // LiveProcess: HOME is the store container; LiveContainer itself: the store lives under Documents
         let fixedURLs = [
+            home.appendingPathComponent("Library/Application Support/SideStore.sqlite"),
             home.appendingPathComponent("Library/Application Support/AltStore.sqlite"),
+            home.appendingPathComponent("Library/Application Support/SideStore/SideStore.sqlite"),
             home.appendingPathComponent("Library/Application Support/AltStore/AltStore.sqlite"),
+            home.appendingPathComponent("Documents/SideStore/Library/Application Support/SideStore.sqlite"),
             home.appendingPathComponent("Documents/SideStore/Library/Application Support/AltStore.sqlite"),
-            home.appendingPathComponent("Documents/SideStore/Library/Application Support/AltStore/AltStore.sqlite"),
-            home.appendingPathComponent("Documents/Library/Application Support/AltStore.sqlite")
+            home.appendingPathComponent("Documents/Library/Application Support/SideStore.sqlite")
         ]
         let existing = fixedURLs.filter { FileManager.default.fileExists(atPath: $0.path) }
         if !existing.isEmpty {
@@ -250,7 +277,7 @@ public final class LCStoreExpiryPublisher: NSObject {
         }
         for item in items {
             let name = item.lastPathComponent
-            if name == "AltStore.sqlite" {
+            if name == "SideStore.sqlite" || name == "AltStore.sqlite" {
                 return item
             }
             guard name != "Applications", name != "Data",

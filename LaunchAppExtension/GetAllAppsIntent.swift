@@ -319,63 +319,45 @@ enum LCSideStoreSupport {
     }
 
     static func expirySubtitle(now: Date = Date()) -> String? {
-        // SideStore's list renders InstalledApp.expirationDate, so the same field is shown here; the
-        // heuristic sources are only a fallback for when the store database cannot be read
-        if let expiration = LCStoreDatabase.expirationDate(forBundleIdentifier: LCStoreRecords.sideStoreBundleIdentifier) {
-            return LCExpiry.text(for: expiration, now: now)
-        }
-        return latestExpiration.map { LCExpiry.text(for: $0, now: now, estimated: true) }
+        LCExpiry.date(from: expirySources).map { LCExpiry.text(for: $0, now: now) }
     }
 
-    // SideStore's runtime lives inside LiveContainer, so the store dies with this app: the newest
-    // renewal out of the store's SideStore/LiveContainer records and the installed profile is the
-    // authoritative one (an old entry, e.g. the original SideStore install that the built-in store
-    // never re-signed, must not override a fresh 7 day renewal).
-    private static var latestExpiration: Date? {
-        var candidates: [LCExpiryCandidate] = []
-        let wanted = Set([LCStoreRecords.sideStoreBundleIdentifier, LCLiveContainerApp.bundleIdentifier].compactMap { $0 })
-        for record in LCStoreRecords.records() where wanted.contains(record.bundleIdentifier) {
-            candidates.append(LCExpiryCandidate(renewed: record.renewed ?? .distantPast, expires: record.expires))
-        }
+    // What iOS enforces is the profile installed in LiveContainer.app, and that is also the date the
+    // store shows for this app; the store's own database can lag behind a refresh (its row may even
+    // say expired while the app still launches), so a database value only wins when it is further out.
+    private static var expirySources: [Date] {
+        var dates: [Date] = []
         if let profile = LCInstalledProfile.profile() {
-            candidates.append(LCExpiryCandidate(renewed: profile.created ?? .distantPast, expires: profile.expiration))
+            dates.append(profile.expiration)
         }
-        return LCExpiry.latest(candidates)
+        let records = LCStoreDatabase.entries()
+        for identifier in [LCStoreDatabase.sideStoreBundleIdentifier, LCLiveContainerApp.bundleIdentifier].compactMap({ $0 }) {
+            if let date = records[identifier] {
+                dates.append(date)
+            }
+        }
+        return dates
     }
-
-    static func expiryText(for expiration: Date, now: Date = Date()) -> String {
-        LCExpiry.text(for: expiration, now: now)
-    }
-}
-
-struct LCExpiryCandidate {
-    let renewed: Date
-    let expires: Date
 }
 
 enum LCExpiry {
-    // the most recently renewed source wins; sources are only compared by renewal time, never by
-    // picking the latest expiration, so a stale leftover record cannot mask a shorter real deadline
-    static func latest(_ candidates: [LCExpiryCandidate]) -> Date? {
-        candidates.max { $0.renewed < $1.renewed }?.expires
+    // a future value wins over a stale past one; the latest future value wins otherwise
+    static func date(from dates: [Date], now: Date = Date()) -> Date? {
+        let future = dates.filter { $0 > now }
+        return future.max() ?? dates.max()
     }
 
-    // SideStore's own pill formats with DateComponentsFormatter (full style, largest unit only), which
-    // rounds to the nearest unit, so the same formatter is used here or the numbers differ by a day.
-    // "≈" marks a fallback value (the store database could not be read).
-    static func text(for expiration: Date, now: Date = Date(), estimated: Bool = false) -> String {
-        let prefix = estimated ? "≈" : ""
+    // identical to SideStore's own pill: DateComponentsFormatter with the largest allowed unit, which
+    // rounds to the nearest unit ("6.999 days" -> "7 days"); expired rows read EXPIRED there too
+    static func text(for expiration: Date, now: Date = Date()) -> String {
         guard expiration.timeIntervalSince(now) > 0 else {
-            return "\(prefix)已过期"
+            return "EXPIRED"
         }
         let formatter = DateComponentsFormatter()
         formatter.unitsStyle = .full
         formatter.allowedUnits = [.day, .hour, .minute]
         formatter.maximumUnitCount = 1
-        guard let value = formatter.string(from: now, to: expiration), !value.isEmpty else {
-            return "\(prefix)即将到期"
-        }
-        return "\(prefix)\(value)后到期"
+        return formatter.string(from: now, to: expiration) ?? "EXPIRED"
     }
 }
 
@@ -384,24 +366,31 @@ enum LCExpiry {
 // The store lives in the built-in SideStore's home (<LC documents>/SideStore) and is named after the
 // CoreData container ("AltStore").
 enum LCStoreDatabase {
-    static func expirationDate(forBundleIdentifier wanted: String) -> Date? {
-        guard !wanted.isEmpty else {
-            return nil
+    static let sideStoreBundleIdentifier = "com.SideStore.SideStore"
+
+    // bundle identifier -> expiration, merged from the app group cache and every readable store file
+    static func entries() -> [String: Date] {
+        var result: [String: Date] = [:]
+        func merge(_ identifier: String, _ date: Date) {
+            if let existing = result[identifier], existing >= date {
+                return
+            }
+            result[identifier] = date
         }
-        // LiveContainer/LiveProcess own the store and republish it here after every refresh; the
-        // extension itself may be sandboxed away from the store file
-        if let cached = LCStoreExpiryCache.expirationDate(forBundleIdentifier: wanted) {
-            return cached
+        // LiveContainer/LiveProcess own the store and republish it after every refresh; the extension
+        // itself may be sandboxed away from the store file
+        for (identifier, date) in LCStoreExpiryCache.entries() {
+            merge(identifier, date)
         }
         for url in storeURLs() {
-            if let date = read(url: url, bundleIdentifier: wanted) {
-                return date
+            for (identifier, date) in read(url: url) {
+                merge(identifier, date)
             }
         }
-        return nil
+        return result
     }
 
-    private static func read(url: URL, bundleIdentifier wanted: String) -> Date? {
+    private static func read(url: URL) -> [String: Date] {
         var db: OpaquePointer?
         if sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE, nil) != SQLITE_OK {
             sqlite3_close(db)
@@ -413,29 +402,36 @@ enum LCStoreDatabase {
                 // still holds the last checkpointed state
                 guard sqlite3_open_v2("file:\(url.path)?immutable=1", &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK else {
                     sqlite3_close(db)
-                    return nil
+                    return [:]
                 }
             }
         }
         defer { sqlite3_close(db) }
 
         // CoreData stores this attribute as REAL seconds since 2001-01-01
-        let sql = "SELECT ZEXPIRATIONDATE FROM ZINSTALLEDAPP WHERE ZBUNDLEIDENTIFIER = ?1 AND ZEXPIRATIONDATE IS NOT NULL ORDER BY ZEXPIRATIONDATE DESC LIMIT 1"
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            return nil
+        guard sqlite3_prepare_v2(db, "SELECT ZBUNDLEIDENTIFIER, ZEXPIRATIONDATE FROM ZINSTALLEDAPP", -1, &stmt, nil) == SQLITE_OK else {
+            return [:]
         }
         defer { sqlite3_finalize(stmt) }
-        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        guard sqlite3_bind_text(stmt, 1, wanted, -1, transient) == SQLITE_OK,
-              sqlite3_step(stmt) == SQLITE_ROW,
-              sqlite3_column_type(stmt, 0) != SQLITE_NULL else {
-            return nil
+
+        var result: [String: Date] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let rawIdentifier = sqlite3_column_text(stmt, 0),
+                  sqlite3_column_type(stmt, 1) != SQLITE_NULL else {
+                continue
+            }
+            let identifier = String(cString: rawIdentifier)
+            let date = Date(timeIntervalSinceReferenceDate: sqlite3_column_double(stmt, 1))
+            if let existing = result[identifier], existing >= date {
+                continue
+            }
+            result[identifier] = date
         }
-        return Date(timeIntervalSinceReferenceDate: sqlite3_column_double(stmt, 0))
+        return result
     }
 
-    private static func storeURLs() -> [URL] {
+    static func storeURLs() -> [URL] {
         var homes: [URL] = []
         if let documents = LCGuestAppList.privateDocURL() {
             homes.append(documents.appendingPathComponent("SideStore"))
@@ -445,7 +441,11 @@ enum LCStoreDatabase {
         }
         var urls: [URL] = []
         for home in homes {
-            for relativePath in ["Library/Application Support/AltStore.sqlite",
+            // the nightly names its CoreData store after the app ("SideStore.sqlite"); older builds
+            // used "AltStore.sqlite"
+            for relativePath in ["Library/Application Support/SideStore.sqlite",
+                                 "Library/Application Support/AltStore.sqlite",
+                                 "Library/Application Support/SideStore/SideStore.sqlite",
                                  "Library/Application Support/AltStore/AltStore.sqlite"] {
                 let url = home.appendingPathComponent(relativePath)
                 if FileManager.default.fileExists(atPath: url.path), !urls.contains(url) {
@@ -458,70 +458,6 @@ enum LCStoreDatabase {
                 for item in contents where item.pathExtension == "sqlite" && !urls.contains(item) {
                     urls.append(item)
                 }
-            }
-        }
-        return urls
-    }
-}
-
-// SideStore rewrites <app group>/widget_data.json at the end of every refresh with the dates it shows
-// in its own app list, so this copy moves with a renewal. The embedded.mobileprovision on disk can
-// lag behind it (SideStore itself falls back to its cached dates when the profile is older than the
-// last refresh), which is why the record is preferred over the profile.
-enum LCStoreRecords {
-    static let sideStoreBundleIdentifier = "com.SideStore.SideStore"
-
-    struct Record {
-        let bundleIdentifier: String
-        let renewed: Date?
-        let expires: Date
-    }
-
-    private struct Snapshot: Decodable {
-        struct App: Decodable {
-            let bundleIdentifier: String
-            let expirationDate: Date
-            let refreshedDate: Date?
-        }
-        let allApps: [App]?
-        let activeApps: [App]?
-    }
-
-    static func records() -> [Record] {
-        snapshotURLs().flatMap { fileURL -> [Record] in
-            guard let data = try? Data(contentsOf: fileURL) else {
-                return []
-            }
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .deferredToDate
-            guard let snapshot = try? decoder.decode(Snapshot.self, from: data) else {
-                return []
-            }
-            let apps = (snapshot.allApps ?? []) + (snapshot.activeApps ?? [])
-            return apps.map {
-                Record(bundleIdentifier: $0.bundleIdentifier, renewed: $0.refreshedDate, expires: $0.expirationDate)
-            }
-        }
-    }
-
-    // both groups can exist on one device; older installs may have left a snapshot behind, so every
-    // candidate file is read and the entries are ranked by their own refreshedDate
-    private static func snapshotURLs() -> [URL] {
-        var groupIDs: [String] = []
-        if let appGroupID = LCSharedUtils.appGroupID() {
-            groupIDs.append(appGroupID)
-        }
-        // SideStore resolves its own group from the executable's entitlements, which can be the store's
-        // plain group instead of LiveContainer's team-suffixed one
-        groupIDs.append("group.com.SideStore.SideStore")
-        var urls: [URL] = []
-        for groupID in Set(groupIDs) {
-            guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID) else {
-                continue
-            }
-            let fileURL = container.appendingPathComponent("widget_data.json")
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                urls.append(fileURL)
             }
         }
         return urls
@@ -569,23 +505,18 @@ enum LCLiveContainerApp {
     }
 
     static func expirySubtitle(now: Date = Date()) -> String? {
-        if let bundleIdentifier, let expiration = LCStoreDatabase.expirationDate(forBundleIdentifier: bundleIdentifier) {
-            return LCExpiry.text(for: expiration, now: now)
-        }
-        return fallbackExpiration.map { LCExpiry.text(for: $0, now: now, estimated: true) }
+        LCExpiry.date(from: expirySources).map { LCExpiry.text(for: $0, now: now) }
     }
 
-    private static var fallbackExpiration: Date? {
-        var candidates: [LCExpiryCandidate] = []
-        if let bundleIdentifier {
-            for record in LCStoreRecords.records() where record.bundleIdentifier == bundleIdentifier {
-                candidates.append(LCExpiryCandidate(renewed: record.renewed ?? .distantPast, expires: record.expires))
-            }
-        }
+    private static var expirySources: [Date] {
+        var dates: [Date] = []
         if let profile = LCInstalledProfile.profile() {
-            candidates.append(LCExpiryCandidate(renewed: profile.created ?? .distantPast, expires: profile.expiration))
+            dates.append(profile.expiration)
         }
-        return LCExpiry.latest(candidates)
+        if let bundleIdentifier, let date = LCStoreDatabase.entries()[bundleIdentifier] {
+            dates.append(date)
+        }
+        return dates
     }
 }
 
@@ -602,14 +533,98 @@ enum LCStoreExpiryCache {
         let apps: [String: Entry]
     }
 
-    static func expirationDate(forBundleIdentifier wanted: String) -> Date? {
-        guard !wanted.isEmpty,
-              let groupURL = LCSharedUtils.appGroupPath(),
+    static func entries() -> [String: Date] {
+        guard let groupURL = LCSharedUtils.appGroupPath(),
               let data = try? Data(contentsOf: groupURL.appendingPathComponent("LCStoreExpiry.json")),
-              let cache = try? JSONDecoder().decode(CacheFile.self, from: data),
-              let entry = cache.apps[wanted] else {
-            return nil
+              let cache = try? JSONDecoder().decode(CacheFile.self, from: data) else {
+            return [:]
         }
-        return Date(timeIntervalSinceReferenceDate: entry.exp)
+        return cache.apps.mapValues { Date(timeIntervalSinceReferenceDate: $0.exp) }
+    }
+}
+
+// Reports exactly what the extension can see, so a "still shows ≈" report can be diagnosed without
+// guessing. Run the action in Shortcuts; the thrown error carries the report.
+enum LCAppListDiagnostics {
+    private struct CacheHeader: Decodable {
+        struct Entry: Decodable {
+            let exp: Double
+        }
+        let written: Double?
+        let apps: [String: Entry]
+        let home: String?
+        let found: String?
+        let tried: [String]?
+        let error: String?
+        let process: String?
+    }
+
+    static func report() -> String {
+        var lines: [String] = []
+        lines.append("extension: \(Bundle.main.bundleIdentifier ?? "?")")
+        let groupID = LCSharedUtils.appGroupID() ?? "nil"
+        let groupURL = LCSharedUtils.appGroupPath()
+        lines.append("app group: \(groupID) accessible=\(groupURL != nil)")
+
+        if let groupURL {
+            let cacheURL = groupURL.appendingPathComponent("LCStoreExpiry.json")
+            var cacheLine = "cache: exists=\(FileManager.default.fileExists(atPath: cacheURL.path))"
+            if let data = try? Data(contentsOf: cacheURL) {
+                cacheLine += " size=\(data.count)"
+                if let header = try? JSONDecoder().decode(CacheHeader.self, from: data) {
+                    if let written = header.written {
+                        cacheLine += " written=\(Date(timeIntervalSinceReferenceDate: written))"
+                    }
+                    cacheLine += " apps=\(header.apps.keys.sorted().joined(separator: ","))"
+                }
+            }
+            lines.append(cacheLine)
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: groupURL.path)) ?? []
+            lines.append("group files: \(names.sorted().joined(separator: ", "))")
+        }
+
+        if let documents = LCGuestAppList.privateDocURL() {
+            lines.append("private doc: \(documents.path)")
+        } else {
+            lines.append("private doc: unresolved (bookmark missing or not resolvable)")
+        }
+
+        let storeURLs = LCStoreDatabase.storeURLs()
+        lines.append("store files: \(storeURLs.count)")
+        for url in storeURLs {
+            let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+            let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+            let sidecars = ["-wal", "-shm"].filter { FileManager.default.fileExists(atPath: url.path + $0) }
+            lines.append("  \(url.path) size=\(size) sidecars=\(sidecars.joined(separator: ","))")
+        }
+
+        for home in [URL(fileURLWithPath: NSHomeDirectory())] {
+            lines.append("HOME: \(home.path)")
+            let support = home.appendingPathComponent("Library/Application Support")
+            let supportNames = (try? FileManager.default.contentsOfDirectory(atPath: support.path)) ?? []
+            lines.append("  HOME/Library/Application Support: \(supportNames.sorted().prefix(12).joined(separator: ", "))")
+        }
+
+        let entries = LCStoreDatabase.entries()
+        lines.append("store entries: \(entries.count)")
+        for (identifier, date) in entries.sorted(by: { $0.key < $1.key }) {
+            lines.append("  \(identifier) expires=\(date)")
+        }
+        if let profile = LCInstalledProfile.profile() {
+            lines.append("installed profile expires: \(profile.expiration)")
+        } else {
+            lines.append("installed profile: none")
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
+struct LCDiagnosticsIntent: AppIntent {
+    static var title: LocalizedStringResource { "LC Diagnostics" }
+    static var description = IntentDescription("Copies where LiveContainer's app list looks for SideStore's expiry data to the clipboard.")
+
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        UIPasteboard.general.string = LCAppListDiagnostics.report()
+        return .result(dialog: "Diagnostics copied to the clipboard.")
     }
 }
