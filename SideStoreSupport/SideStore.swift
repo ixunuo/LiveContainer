@@ -14,6 +14,8 @@ func performIntentRefresh(identifier: String, mangledTypeName: String, intentPro
     intentProgress.totalUnitCount = 100
     if UserDefaults.isSideStore() {
         try await SideStoreIntentCaller.shared.callRefreshIntent(mangledTypeName: mangledTypeName)
+        // the store database now holds the new dates; publish them for the app list extension
+        LCStoreExpiryPublisher.publish()
     } else {
         RefreshHandler.shared.progress = intentProgress
         try await RefreshHandler.shared.startRefresh(identifier: identifier, mangledName: mangledTypeName)

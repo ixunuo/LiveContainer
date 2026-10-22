@@ -360,21 +360,22 @@ enum LCExpiry {
         candidates.max { $0.renewed < $1.renewed }?.expires
     }
 
-    // SideStore's own pill uses calendar day components (then hours inside the last day), so the
-    // numbers have to be computed the same way or the lists disagree by a day. "≈" marks a fallback
-    // value (the store database could not be read), i.e. a number SideStore itself may not show.
+    // SideStore's own pill formats with DateComponentsFormatter (full style, largest unit only), which
+    // rounds to the nearest unit, so the same formatter is used here or the numbers differ by a day.
+    // "≈" marks a fallback value (the store database could not be read).
     static func text(for expiration: Date, now: Date = Date(), estimated: Bool = false) -> String {
         let prefix = estimated ? "≈" : ""
         guard expiration.timeIntervalSince(now) > 0 else {
-            return "⚠️ \(prefix)已过期"
+            return "\(prefix)已过期"
         }
-        let calendar = Calendar.current
-        let days = calendar.dateComponents([.day], from: now, to: expiration).day ?? 0
-        if days >= 1 {
-            return days <= 2 ? "⚠️ \(prefix)\(days)天后到期" : "\(prefix)\(days)天后到期"
+        let formatter = DateComponentsFormatter()
+        formatter.unitsStyle = .full
+        formatter.allowedUnits = [.day, .hour, .minute]
+        formatter.maximumUnitCount = 1
+        guard let value = formatter.string(from: now, to: expiration), !value.isEmpty else {
+            return "\(prefix)即将到期"
         }
-        let hours = max(1, calendar.dateComponents([.hour], from: now, to: expiration).hour ?? 0)
-        return "⚠️ \(prefix)\(hours)小时后到期"
+        return "\(prefix)\(value)后到期"
     }
 }
 
@@ -386,6 +387,11 @@ enum LCStoreDatabase {
     static func expirationDate(forBundleIdentifier wanted: String) -> Date? {
         guard !wanted.isEmpty else {
             return nil
+        }
+        // LiveContainer/LiveProcess own the store and republish it here after every refresh; the
+        // extension itself may be sandboxed away from the store file
+        if let cached = LCStoreExpiryCache.expirationDate(forBundleIdentifier: wanted) {
+            return cached
         }
         for url in storeURLs() {
             if let date = read(url: url, bundleIdentifier: wanted) {
@@ -580,5 +586,30 @@ enum LCLiveContainerApp {
             candidates.append(LCExpiryCandidate(renewed: profile.created ?? .distantPast, expires: profile.expiration))
         }
         return LCExpiry.latest(candidates)
+    }
+}
+
+// LiveContainer/LiveProcess republish SideStore's own renewal dates into the app group after each
+// refresh (they own the store container), so this is the same data SideStore's list shows.
+enum LCStoreExpiryCache {
+    private struct Entry: Decodable {
+        let exp: Double
+        let refreshed: Double?
+    }
+
+    private struct CacheFile: Decodable {
+        let written: Double?
+        let apps: [String: Entry]
+    }
+
+    static func expirationDate(forBundleIdentifier wanted: String) -> Date? {
+        guard !wanted.isEmpty,
+              let groupURL = LCSharedUtils.appGroupPath(),
+              let data = try? Data(contentsOf: groupURL.appendingPathComponent("LCStoreExpiry.json")),
+              let cache = try? JSONDecoder().decode(CacheFile.self, from: data),
+              let entry = cache.apps[wanted] else {
+            return nil
+        }
+        return Date(timeIntervalSinceReferenceDate: entry.exp)
     }
 }

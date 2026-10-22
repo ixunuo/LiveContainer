@@ -2,6 +2,7 @@
 #define SideStore_Bridging_Header_h_h
 
 #include "../LiveContainer/FoundationPrivate.h"
+#include "../LiveContainer/LCSharedUtils.h"
 #include "XPCServer.h"
 #include "../LiveContainer/utils.h"
 #include "PrivateIntentRunner.h"

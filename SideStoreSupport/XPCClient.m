@@ -37,6 +37,15 @@ void installSideStoreHooks(void);
     
     installSideStoreHooks();
     
+    // both LiveContainer and LiveProcess own the store container; publish the renewals it holds so
+    // the Shortcuts extension (which may not be able to read the store itself) can show them
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        Class publisher = NSClassFromString(@"LCStoreExpiryPublisher");
+        if ([publisher respondsToSelector:@selector(publish)]) {
+            [publisher performSelector:@selector(publish)];
+        }
+    });
+    
     if(!NSUserDefaults.isLiveProcess) return;
     
     handler = [PrivClass(LiveProcessSideStoreHandler) shared];

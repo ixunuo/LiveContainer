@@ -8,6 +8,7 @@
 import Foundation
 import AppIntents
 import OSLog
+import SQLite3
 
 enum SideStoreIntentError: LocalizedError {
     case typeNotFound(String)
@@ -102,6 +103,7 @@ struct SideStoreIntentCaller {
                     }
                 }
                 obs?.invalidate()
+                LCStoreExpiryPublisher.publishNow()
                 server.finish(nil)
             } catch {
                 server.finish("\(LCAnisetteDiagnostics()) | anisetteSeed=\(anisetteSeedState) | \(error.localizedDescription)")
@@ -138,5 +140,129 @@ private func ensureAnisetteServerListExists() -> String {
         return "written"
     } catch {
         return "failed(\(error.localizedDescription))"
+    }
+}
+
+/// SideStore's app list renders `InstalledApp.expirationDate` out of its CoreData store. Only the
+/// processes that own the store (LiveContainer / LiveProcess, whose HOME is the store container) can
+/// always read it, so the values are published into the app group for the Shortcuts extension.
+@objc(LCStoreExpiryPublisher)
+public final class LCStoreExpiryPublisher: NSObject {
+    private struct StoreEntry: Codable {
+        let exp: Double
+        let refreshed: Double?
+    }
+
+    private struct CacheFile: Codable {
+        let written: Double
+        let apps: [String: StoreEntry]
+    }
+
+    @objc public static func publish() {
+        DispatchQueue.global(qos: .utility).async {
+            publishNow()
+        }
+    }
+
+    // LiveProcess can be torn down as soon as the refresh is reported, so the exit path writes inline
+    @objc public static func publishNow() {
+        guard let apps = readStore(), !apps.isEmpty,
+              let groupURL = LCSharedUtils.appGroupPath() else {
+            return
+        }
+        let cache = CacheFile(written: Date().timeIntervalSinceReferenceDate, apps: apps)
+        guard let data = try? JSONEncoder().encode(cache) else { return }
+        try? data.write(to: groupURL.appendingPathComponent("LCStoreExpiry.json"), options: .atomic)
+    }
+
+    private static func readStore() -> [String: StoreEntry]? {
+        for url in storeURLs() {
+            if let entries = read(url: url) {
+                return entries
+            }
+        }
+        return nil
+    }
+
+    private static func read(url: URL) -> [String: StoreEntry]? {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK
+                || sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            sqlite3_close(db)
+            return nil
+        }
+        defer { sqlite3_close(db) }
+
+        // CoreData stores these attributes as REAL seconds since 2001-01-01
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT ZBUNDLEIDENTIFIER, ZEXPIRATIONDATE, ZREFRESHEDDATE FROM ZINSTALLEDAPP", -1, &stmt, nil) == SQLITE_OK else {
+            return nil
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var result: [String: StoreEntry] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let rawIdentifier = sqlite3_column_text(stmt, 0),
+                  sqlite3_column_type(stmt, 1) != SQLITE_NULL else {
+                continue
+            }
+            let identifier = String(cString: rawIdentifier)
+            let expiration = sqlite3_column_double(stmt, 1)
+            if let existing = result[identifier], existing.exp >= expiration {
+                continue
+            }
+            let refreshed = sqlite3_column_type(stmt, 2) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 2)
+            result[identifier] = StoreEntry(exp: expiration, refreshed: refreshed)
+        }
+        return result
+    }
+
+    private static func storeURLs() -> [URL] {
+        let home = URL(fileURLWithPath: NSHomeDirectory())
+        // LiveProcess: HOME is the store container; LiveContainer itself: the store lives under Documents
+        let fixedURLs = [
+            home.appendingPathComponent("Library/Application Support/AltStore.sqlite"),
+            home.appendingPathComponent("Library/Application Support/AltStore/AltStore.sqlite"),
+            home.appendingPathComponent("Documents/SideStore/Library/Application Support/AltStore.sqlite"),
+            home.appendingPathComponent("Documents/SideStore/Library/Application Support/AltStore/AltStore.sqlite"),
+            home.appendingPathComponent("Documents/Library/Application Support/AltStore.sqlite")
+        ]
+        let existing = fixedURLs.filter { FileManager.default.fileExists(atPath: $0.path) }
+        if !existing.isEmpty {
+            return existing
+        }
+        // unknown layout: shallow search for the store file, skipping app bundles and payload folders
+        for root in [home.appendingPathComponent("Documents/SideStore"),
+                     home.appendingPathComponent("Library/Application Support"),
+                     home.appendingPathComponent("Documents")] {
+            if let found = findStore(under: root, depth: 0) {
+                return [found]
+            }
+        }
+        return []
+    }
+
+    private static func findStore(under url: URL, depth: Int) -> URL? {
+        guard depth <= 4 else { return nil }
+        let fileManager = FileManager.default
+        guard let items = try? fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isDirectoryKey]) else {
+            return nil
+        }
+        for item in items {
+            let name = item.lastPathComponent
+            if name == "AltStore.sqlite" {
+                return item
+            }
+            guard name != "Applications", name != "Data",
+                  !name.hasSuffix(".app"), !name.hasSuffix(".ipa"), !name.hasSuffix(".appex") else {
+                continue
+            }
+            var isDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: item.path, isDirectory: &isDirectory), isDirectory.boolValue,
+               let found = findStore(under: item, depth: depth + 1) {
+                return found
+            }
+        }
+        return nil
     }
 }
